@@ -77,7 +77,7 @@ func expectTransaction(t *testing.T, e *eventStore) mapstr.M {
 }
 
 func TestAmqp_UnknownMethod(t *testing.T) {
-	logp.TestingSetup(logp.WithSelectors("amqp", "amqpdetailed"))
+	logp.TestingSetup(logp.WithSelectors("amqp", "amqpdetailed")) //nolint:staticcheck // SA1019: the map based dispatch makes this difficult.
 
 	_, amqp, err := amqpModForTests()
 	assert.NoError(t, err)
@@ -96,7 +96,7 @@ func TestAmqp_UnknownMethod(t *testing.T) {
 }
 
 func TestAmqp_FrameSize(t *testing.T) {
-	logp.TestingSetup(logp.WithSelectors("amqp", "amqpdetailed"))
+	logp.TestingSetup(logp.WithSelectors("amqp", "amqpdetailed")) //nolint:staticcheck // SA1019: the map based dispatch makes this difficult.
 
 	_, amqp, err := amqpModForTests()
 	assert.NoError(t, err)
@@ -119,6 +119,7 @@ func TestAmqp_FrameSize(t *testing.T) {
 // Test that the parser doesn't panic on a partial message that includes
 // a client header
 func TestAmqp_PartialFrameSize(t *testing.T) {
+	//nolint:staticcheck // SA1019: the map based dispatch makes this difficult.
 	logp.TestingSetup(logp.WithSelectors("amqp", "amqpdetailed"))
 
 	_, amqp, err := amqpModForTests()
