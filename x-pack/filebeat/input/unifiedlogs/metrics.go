@@ -11,7 +11,9 @@ import (
 )
 
 type inputMetrics struct {
-	errs *monitoring.Uint // total number of errors
+	errs            *monitoring.Uint
+	streamFallbacks *monitoring.Uint
+	duplicates      *monitoring.Uint
 }
 
 func newInputMetrics(reg *monitoring.Registry) *inputMetrics {
@@ -20,8 +22,28 @@ func newInputMetrics(reg *monitoring.Registry) *inputMetrics {
 	}
 
 	out := &inputMetrics{
-		errs: monitoring.NewUint(reg, "errors_total"),
+		errs:            monitoring.NewUint(reg, "errors_total"),
+		streamFallbacks: monitoring.NewUint(reg, "stream_fallbacks_total"),
+		duplicates:      monitoring.NewUint(reg, "duplicates_dropped_total"),
 	}
 
 	return out
+}
+
+func (input *input) addError() {
+	if input.metrics != nil {
+		input.metrics.errs.Add(1)
+	}
+}
+
+func (input *input) addStreamFallback() {
+	if input.metrics != nil {
+		input.metrics.streamFallbacks.Add(1)
+	}
+}
+
+func (input *input) addDuplicate() {
+	if input.metrics != nil {
+		input.metrics.duplicates.Add(1)
+	}
 }

@@ -1,0 +1,8 @@
+kind: enhancement
+summary: Collect macOS unified logs through native APIs
+description: |
+  The Filebeat unifiedlogs input now uses macOS native unified logging APIs for
+  live collection, history, and log archives. It no longer invokes the `log`
+  command-line tool, and native event IDs and versioned cursors reduce duplicate
+  events when the input resumes or falls back to Store polling.
+component: filebeat

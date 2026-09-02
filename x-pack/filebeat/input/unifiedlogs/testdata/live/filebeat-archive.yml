@@ -1,0 +1,20 @@
+filebeat.inputs:
+  - type: unifiedlogs
+    id: unifiedlogs-e2e-archive
+    enabled: true
+    archive_file: '${UNIFIEDLOGS_E2E_ARCHIVE}'
+    info: true
+    debug: true
+    signpost: true
+    fields_under_root: true
+    fields:
+      e2e_source: archive
+    tags: ["unifiedlogs-e2e", "archive"]
+
+output.logstash:
+  hosts: ["127.0.0.1:5044"]
+  bulk_max_size: 64
+
+logging.level: debug
+logging.selectors: ["*"]
+logging.to_stderr: true

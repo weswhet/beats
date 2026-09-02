@@ -1,0 +1,55 @@
+filebeat.inputs:
+  - type: unifiedlogs
+    id: unifiedlogs-e2e-emitter-all
+    enabled: true
+    predicate:
+      - 'subsystem == "co.elastic.filebeat.unifiedlogs.e2e.primary"'
+      - 'subsystem == "co.elastic.filebeat.unifiedlogs.e2e.secondary"'
+    info: true
+    debug: true
+    signpost: true
+    fields_under_root: true
+    fields:
+      e2e_source: emitter_all
+    tags: ["unifiedlogs-e2e", "predicate-or"]
+
+  - type: unifiedlogs
+    id: unifiedlogs-e2e-emitter-defaults
+    enabled: true
+    predicate:
+      - 'subsystem == "co.elastic.filebeat.unifiedlogs.e2e.primary"'
+      - 'subsystem == "co.elastic.filebeat.unifiedlogs.e2e.secondary"'
+    info: false
+    debug: false
+    signpost: false
+    fields_under_root: true
+    fields:
+      e2e_source: emitter_default_error_fault
+    tags: ["unifiedlogs-e2e", "level-filter"]
+
+  - type: unifiedlogs
+    id: unifiedlogs-e2e-selected-system
+    enabled: true
+    process:
+      - trustd
+      - runningboardd
+      - logd
+    info: true
+    debug: false
+    signpost: false
+    fields_under_root: true
+    fields:
+      e2e_source: selected_system_processes
+    tags: ["unifiedlogs-e2e", "process-or"]
+
+output.logstash:
+  hosts: ["127.0.0.1:5044"]
+  bulk_max_size: 16
+
+http.enabled: true
+http.host: 127.0.0.1
+http.port: 5066
+
+logging.level: debug
+logging.selectors: ["*"]
+logging.to_stderr: true

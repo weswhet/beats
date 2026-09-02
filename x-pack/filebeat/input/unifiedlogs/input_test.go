@@ -7,16 +7,10 @@
 package unifiedlogs
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"fmt"
-	"os"
-	"os/exec"
-	"path"
-	"regexp"
-	"strings"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,386 +24,388 @@ import (
 	"github.com/elastic/elastic-agent-libs/monitoring"
 )
 
-var _ inputcursor.Publisher = (*publisher)(nil)
+var _ inputcursor.Publisher = (*recordingPublisher)(nil)
 
-type publisher struct {
-	m sync.Mutex
+type recordingPublisher struct {
+	mu sync.Mutex
 
 	events  []beat.Event
-	cursors []*time.Time
+	cursors []any
+	err     error
+	notify  chan struct{}
+	onEvent func(beat.Event, any)
 }
 
-func (p *publisher) Publish(e beat.Event, cursor any) error {
-	p.m.Lock()
-	defer p.m.Unlock()
+func (p *recordingPublisher) Publish(event beat.Event, cursor any) error {
+	p.mu.Lock()
+	p.events = append(p.events, event)
+	p.cursors = append(p.cursors, cursor)
+	err := p.err
+	onEvent := p.onEvent
+	notify := p.notify
+	p.mu.Unlock()
 
-	p.events = append(p.events, e)
-	var c *time.Time
-	if cursor != nil {
-		cv, _ := cursor.(time.Time)
-		c = &cv
+	if onEvent != nil {
+		onEvent(event, cursor)
 	}
-	p.cursors = append(p.cursors, c)
-	return nil
+	if notify != nil {
+		select {
+		case notify <- struct{}{}:
+		default:
+		}
+	}
+	return err
 }
 
-func TestInput(t *testing.T) {
-	archivePath, err := openArchive()
-	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(archivePath) })
+func (p *recordingPublisher) snapshot() ([]beat.Event, []any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]beat.Event(nil), p.events...), append([]any(nil), p.cursors...)
+}
 
-	testCases := []struct {
-		name                 string
-		skip                 func(*testing.T) bool
-		cfg                  config
-		timeUntilClose       time.Duration
-		assertFunc           func(collect *assert.CollectT, events []beat.Event, cursors []*time.Time)
-		expectedLogStreamCmd string
-		expectedLogShowCmd   string
-		expectedRunErrorMsg  string
+type fakeNativeReader struct {
+	mu sync.Mutex
+
+	storeQueries  []nativeQuery
+	streamQueries []nativeQuery
+	storeFn       func(context.Context, nativeQuery, func(nativeEvent) error) error
+	streamFn      func(context.Context, nativeQuery, func(nativeEvent) error) error
+}
+
+func (r *fakeNativeReader) ReadStore(ctx context.Context, query nativeQuery, emit func(nativeEvent) error) error {
+	r.mu.Lock()
+	r.storeQueries = append(r.storeQueries, query)
+	fn := r.storeFn
+	r.mu.Unlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(ctx, query, emit)
+}
+
+func (r *fakeNativeReader) Stream(ctx context.Context, query nativeQuery, emit func(nativeEvent) error) error {
+	r.mu.Lock()
+	r.streamQueries = append(r.streamQueries, query)
+	fn := r.streamFn
+	r.mu.Unlock()
+	if fn == nil {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return fn(ctx, query, emit)
+}
+
+func (r *fakeNativeReader) queries() ([]nativeQuery, []nativeQuery) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]nativeQuery(nil), r.storeQueries...), append([]nativeQuery(nil), r.streamQueries...)
+}
+
+func testNativeLog(timestamp time.Time, message string) nativeEvent {
+	return nativeEvent{
+		Timestamp: timestamp,
+		Kind:      nativeKindLog,
+		Level:     nativeLevelDefault,
+		Message:   message,
+		Process:   "test-process",
+	}
+}
+
+func TestSourceNamesRemainStable(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  config
+		want string
 	}{
-		{
-			name:                 "Default stream",
-			cfg:                  config{},
-			timeUntilClose:       5 * time.Second,
-			expectedLogStreamCmd: "/usr/bin/log stream --style ndjson",
-			assertFunc: func(collect *assert.CollectT, events []beat.Event, cursors []*time.Time) {
-				require.NotEmpty(collect, events)
-				require.NotEmpty(collect, cursors)
-				assert.Len(collect, events, len(cursors))
-				lastEvent := events[len(events)-1]
-				lastCursor := cursors[len(cursors)-1]
-				assert.Equal(collect, &lastEvent.Timestamp, lastCursor)
-			},
-		},
-		{
-			name: "Archive not found",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: "notfound.logarchive",
-				},
-			},
-			timeUntilClose:      5 * time.Second,
-			expectedLogShowCmd:  "/usr/bin/log show --style ndjson --archive notfound.logarchive",
-			expectedRunErrorMsg: "\"/usr/bin/log show --style ndjson --archive notfound.logarchive\" exited with an error: exit status 64",
-		},
-		{
-			name: "Archived file",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s", archivePath),
-			assertFunc:         eventsAndCursorAssertN(462),
-		},
-		{
-			name: "Trace file",
-			cfg: config{
-				ShowConfig: showConfig{
-					TraceFile: path.Join(archivePath, "logdata.LiveData.tracev3"),
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --file %s", path.Join(archivePath, "logdata.LiveData.tracev3")),
-			assertFunc:         eventsAndCursorAssertN(7),
-		},
-		{
-			name: "With start date",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-					Start:       "2024-12-04 13:46:00+0200",
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s --start 2024-12-04 13:46:00+0200", archivePath),
-			assertFunc:         eventsAndCursorAssertN(314),
-		},
-		{
-			name: "With start and end dates",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-					Start:       "2024-12-04 13:45:00+0200",
-					End:         "2024-12-04 13:46:00+0200",
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s --start 2024-12-04 13:45:00+0200 --end 2024-12-04 13:46:00+0200", archivePath),
-			assertFunc:         eventsAndCursorAssertN(149),
-		},
-		{
-			name: "With end date",
-			skip: func(t *testing.T) bool {
-				const sequoiaPrefix = "15."
-				version, err := exec.Command("sw_vers", "-productVersion").CombinedOutput()
-				if err != nil {
-					t.Fatalf("failed to get macOS version: %v", err)
-					return true
-				}
-				if strings.HasPrefix(strings.TrimSpace(string(version)), sequoiaPrefix) {
-					t.Skip("macOS 15.x does not support the --end flag correctly")
-					return true
-				}
-				return false
-			},
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-					End:         "2024-12-04 13:46:00+0200",
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s --end 2024-12-04 13:46:00+0200", archivePath),
-			assertFunc:         eventsAndCursorAssertN(149),
-		},
-		{
-			name: "With predicate",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-				},
-				CommonConfig: commonConfig{
-					Predicate: []string{
-						`processImagePath == "/kernel"`,
-					},
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s --predicate processImagePath == \"/kernel\"", archivePath),
-			assertFunc:         eventsAndCursorAssertN(460),
-		},
-		{
-			name: "With process",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-				},
-				CommonConfig: commonConfig{
-					Process: []string{
-						"0",
-					},
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s --process 0", archivePath),
-			assertFunc:         eventsAndCursorAssertN(462),
-		},
-		{
-			name: "With optional flags",
-			cfg: config{
-				ShowConfig: showConfig{
-					ArchiveFile: archivePath,
-				},
-				CommonConfig: commonConfig{
-					Info:               true,
-					Debug:              true,
-					Backtrace:          true,
-					Signpost:           true,
-					MachContinuousTime: true,
-				},
-			},
-			timeUntilClose:     5 * time.Second,
-			expectedLogShowCmd: fmt.Sprintf("/usr/bin/log show --style ndjson --archive %s --info --debug --backtrace --signpost --mach-continuous-time", archivePath),
-			assertFunc:         eventsAndCursorAssertN(462),
-		},
+		{name: "local store", cfg: config{}, want: srcPollName},
+		{name: "archive store", cfg: config{ShowConfig: showConfig{ArchiveFile: "test.logarchive"}}, want: srcArchiveName},
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.skip != nil && tc.skip(t) {
-				return
-			}
-			_, cursorInput := newCursorInput(tc.cfg)
-			input, _ := cursorInput.(*input)
-
-			ctx, cancel := context.WithCancel(context.Background())
-
-			pub := &publisher{}
-			log, buf := logp.NewInMemoryLocal("unifiedlogs_test", logp.JSONEncoderConfig())
-
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go func(t *testing.T) {
-				defer wg.Done()
-				err := input.runWithMetrics(ctx, pub, testMetricsRegistry(), log)
-				if tc.expectedRunErrorMsg == "" {
-					assert.NoError(t, err)
-				} else {
-					assert.ErrorContains(t, err, tc.expectedRunErrorMsg)
-				}
-			}(t)
-
-			select {
-			case <-ctx.Done():
-			case <-time.After(tc.timeUntilClose):
-			}
-
-			cancel()
-			wg.Wait()
-
-			assert.EventuallyWithT(t,
-				func(collect *assert.CollectT) {
-					assert.Equal(collect, tc.expectedLogStreamCmd, filterStartLogStreamLogline(buf.Bytes()))
-					assert.Equal(collect, tc.expectedLogShowCmd, filterStartLogShowLogline(buf.Bytes()))
-					if tc.assertFunc != nil {
-						tc.assertFunc(collect, pub.events, pub.cursors)
-					}
-				},
-				60*time.Second, time.Second,
-			)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, newSource(test.cfg).Name(), "the hidden source name must remain registry-compatible")
 		})
 	}
 }
 
-func TestBackfillAndStream(t *testing.T) {
-	archivePath, err := openArchive()
-	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(archivePath) })
-
-	cfg := config{
-		Backfill: true,
-		ShowConfig: showConfig{
-			Start: time.Now().Add(-5 * time.Second).Format("2006-01-02 15:04:05"),
+func TestDefaultInputStreamsNativeEvents(t *testing.T) {
+	boundary := time.Date(2026, time.September, 1, 10, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &fakeNativeReader{
+		streamFn: func(ctx context.Context, query nativeQuery, emit func(nativeEvent) error) error {
+			if err := emit(testNativeLog(boundary.Add(time.Second), "live")); err != nil {
+				return err
+			}
+			<-ctx.Done()
+			return ctx.Err()
 		},
-		CommonConfig: commonConfig{
-			Info:               true,
-			Debug:              true,
-			Backtrace:          true,
-			Signpost:           true,
-			MachContinuousTime: true,
+	}
+	pub := &recordingPublisher{onEvent: func(beat.Event, any) { cancel() }}
+	inp := &input{config: config{}, reader: reader, now: func() time.Time { return boundary }}
+
+	err := inp.runWithMetrics(ctx, pub, nil, logp.NewLogger("unifiedlogs_test"))
+	require.NoError(t, err, "canceling a native live stream should stop the input cleanly")
+
+	storeQueries, streamQueries := reader.queries()
+	assert.Empty(t, storeQueries, "a new default input should not read historical Store data")
+	require.Len(t, streamQueries, 1, "a new default input should create one native stream")
+	assert.Equal(t, boundary, streamQueries[0].Start, "the native stream should begin at the run boundary")
+
+	events, cursors := pub.snapshot()
+	require.Len(t, events, 1, "the live native event should be published once")
+	require.Len(t, cursors, 1, "each published event should have a corresponding cursor slot")
+	assert.Equal(t, boundary.Add(time.Second), events[0].Timestamp, "the outer timestamp should be the native event date")
+	assert.IsType(t, cursorState{}, cursors[0], "live events should advance a versioned cursor when no backfill is active")
+}
+
+func TestOneShotStoreModes(t *testing.T) {
+	end := "2026-09-01 10:00:00+0000"
+	tests := []struct {
+		name        string
+		cfg         config
+		wantArchive string
+		wantEnd     time.Time
+	}{
+		{
+			name:        "archive",
+			cfg:         config{ShowConfig: showConfig{ArchiveFile: "/tmp/test.logarchive"}},
+			wantArchive: "/tmp/test.logarchive",
+		},
+		{
+			name:    "bounded local history",
+			cfg:     config{ShowConfig: showConfig{End: end}},
+			wantEnd: time.Date(2026, time.September, 1, 10, 0, 0, 0, time.UTC),
 		},
 	}
 
-	expectedLogShowCmd := fmt.Sprintf("/usr/bin/log show --style ndjson --info --debug --backtrace --signpost --mach-continuous-time --start %v", time.Now().Format("2006-01-02"))
-	expectedLogStreamCmd := "/usr/bin/log stream --style ndjson --info --debug --backtrace --signpost --mach-continuous-time"
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &fakeNativeReader{}
+			inp := &input{config: test.cfg, reader: reader}
+			err := inp.runWithMetrics(context.Background(), &recordingPublisher{}, nil, logp.NewLogger("unifiedlogs_test"))
+			require.NoError(t, err, "a successful one-shot native Store read should complete")
 
-	_, cursorInput := newCursorInput(cfg)
-	input := cursorInput.(*input)
+			storeQueries, streamQueries := reader.queries()
+			require.Len(t, storeQueries, 1, "a one-shot input should take one fixed Store snapshot")
+			assert.Empty(t, streamQueries, "a one-shot input should never start the private stream")
+			assert.Equal(t, test.wantArchive, storeQueries[0].ArchiveFile, "the Store query should preserve the archive path")
+			assert.True(t, test.wantEnd.Equal(storeQueries[0].End), "the Store query should preserve the inclusive end date")
+		})
+	}
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	pub := &publisher{}
-	log, buf := logp.NewInMemoryLocal("unifiedlogs_test", logp.JSONEncoderConfig())
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func(t *testing.T) {
-		defer wg.Done()
-		err := input.runWithMetrics(ctx, pub, testMetricsRegistry(), log)
-		assert.NoError(t, err)
-	}(t)
-
-	var firstStreamedEventTime *time.Time
-	assert.EventuallyWithT(t,
-		func(collect *assert.CollectT) {
-			showCmdLog := filterStartLogShowLogline(buf.Bytes())
-			assert.Equal(collect, expectedLogStreamCmd, filterStartLogStreamLogline(buf.Bytes()))
-			assert.True(collect, strings.HasPrefix(showCmdLog, expectedLogShowCmd))
-			require.NotEmpty(collect, pub.events)
-			require.NotEmpty(collect, pub.cursors)
-
-			var endTime time.Time
-			regex := regexp.MustCompile(`--end\s+(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[+-]\d{4})`)
-			matches := regex.FindStringSubmatch(showCmdLog)
-			require.Len(collect, matches, 2)
-			endTime, _ = time.Parse("2006-01-02 15:04:05-0700", matches[1])
-			endTime = endTime.Truncate(time.Second)
-
-			if firstStreamedEventTime == nil {
-				for i := range pub.events {
-					if pub.cursors[i] == nil {
-						first := pub.events[i].Timestamp.Add(time.Second).Truncate(time.Second)
-						firstStreamedEventTime = &first
-						break
-					}
+func TestStoreBoundsAreExactlyInclusive(t *testing.T) {
+	start := time.Date(2026, time.September, 1, 10, 0, 0, 0, time.UTC)
+	end := start.Add(2 * time.Second)
+	reader := &fakeNativeReader{
+		storeFn: func(_ context.Context, _ nativeQuery, emit func(nativeEvent) error) error {
+			for _, event := range []nativeEvent{
+				testNativeLog(start.Add(-time.Microsecond), "before"),
+				testNativeLog(start, "start"),
+				testNativeLog(end, "end"),
+				testNativeLog(end.Add(time.Microsecond), "after"),
+			} {
+				if err := emit(event); err != nil {
+					return err
 				}
 			}
-			require.NotNil(collect, firstStreamedEventTime)
-			assert.Equal(collect, endTime, *firstStreamedEventTime)
-			assert.True(collect, strings.HasPrefix(showCmdLog, filterEndLogShowLogline(buf.Bytes())))
+			return nil
 		},
-		30*time.Second, time.Second,
-	)
+	}
+	cfg := config{ShowConfig: showConfig{
+		ArchiveFile: "/tmp/test.logarchive",
+		Start:       start.Format(cursorDateLayout),
+		End:         end.Format(cursorDateLayout),
+	}}
+	pub := &recordingPublisher{}
+	inp := &input{config: cfg, reader: reader}
 
+	err := inp.runWithMetrics(context.Background(), pub, nil, logp.NewLogger("unifiedlogs_test"))
+	require.NoError(t, err, "an inclusive bounded Store read should complete")
+	events, _ := pub.snapshot()
+	require.Len(t, events, 2, "only events on or inside the exact requested bounds should be published")
+	assert.Equal(t, start, events[0].Timestamp, "an event exactly at the start should be included")
+	assert.Equal(t, end, events[1].Timestamp, "an event exactly at the end should be included")
+}
+
+func TestBackfillAndStreamRunConcurrently(t *testing.T) {
+	boundary := time.Date(2026, time.September, 1, 10, 0, 0, 0, time.UTC)
+	streamPublished := make(chan struct{})
+	storeFinished := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	reader := &fakeNativeReader{}
+	reader.streamFn = func(ctx context.Context, _ nativeQuery, emit func(nativeEvent) error) error {
+		if err := emit(testNativeLog(boundary.Add(time.Second), "live-during-backfill")); err != nil {
+			return err
+		}
+		close(streamPublished)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	reader.storeFn = func(_ context.Context, _ nativeQuery, emit func(nativeEvent) error) error {
+		select {
+		case <-streamPublished:
+		case <-time.After(5 * time.Second):
+			return errors.New("native stream did not start concurrently")
+		}
+		if err := emit(testNativeLog(boundary.Add(-time.Second), "history")); err != nil {
+			return err
+		}
+		close(storeFinished)
+		return nil
+	}
+
+	pub := &recordingPublisher{notify: make(chan struct{}, 4)}
+	inp := &input{
+		config: config{Backfill: true},
+		reader: reader,
+		now:    func() time.Time { return boundary },
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- inp.runWithMetrics(ctx, pub, nil, logp.NewLogger("unifiedlogs_test"))
+	}()
+
+	select {
+	case <-storeFinished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for concurrent native backfill")
+	}
+	require.Eventually(t, func() bool {
+		events, _ := pub.snapshot()
+		return len(events) == 2
+	}, 5*time.Second, time.Millisecond, "both live and historical native events should be published")
 	cancel()
-	wg.Wait()
+	require.NoError(t, <-done, "canceling after concurrent backfill should stop the input cleanly")
+
+	events, cursors := pub.snapshot()
+	require.Len(t, events, 2, "concurrent backfill should publish one live and one historical event")
+	require.Len(t, cursors, 2, "concurrent events should have matching cursor slots")
+	assert.Nil(t, cursors[0], "a live event published before backfill completes must not advance the cursor")
+	assert.IsType(t, cursorState{}, cursors[1], "a historical event should advance the cursor while backfill is active")
+
+	storeQueries, streamQueries := reader.queries()
+	require.Len(t, storeQueries, 1, "backfill should use one fixed Store snapshot")
+	require.Len(t, streamQueries, 1, "backfill should run beside one live stream")
+	assert.Equal(t, boundary, storeQueries[0].End, "the backfill should end at the live collection boundary")
+	assert.Equal(t, boundary, streamQueries[0].Start, "the live stream should start at the same boundary")
 }
 
-const (
-	cmdStartPrefix = "exec command start: "
-	cmdEndPrefix   = "exec command end: "
-)
-
-func filterStartLogStreamLogline(buf []byte) string {
-	const cmd = "/usr/bin/log stream"
-	return filterLogCmdLine(buf, cmd, cmdStartPrefix)
-}
-
-func filterStartLogShowLogline(buf []byte) string {
-	const cmd = "/usr/bin/log show"
-	return filterLogCmdLine(buf, cmd, cmdStartPrefix)
-}
-
-func filterEndLogShowLogline(buf []byte) string {
-	const cmd = "/usr/bin/log show"
-	return filterLogCmdLine(buf, cmd, cmdEndPrefix)
-}
-
-func filterLogCmdLine(buf []byte, cmd, cmdPrefix string) string {
-	scanner := bufio.NewScanner(bytes.NewBuffer(buf))
-	for scanner.Scan() {
-		// The message is the last field; the local logger prepends caller info.
-		parts := strings.Split(scanner.Text(), "\t")
-		if len(parts) < 4 {
-			continue
-		}
-
-		trimmed := strings.TrimPrefix(parts[len(parts)-1], cmdPrefix)
-		if strings.HasPrefix(trimmed, cmd) {
-			return trimmed
-		}
+func TestResumeUsesFiveSecondStoreOverlap(t *testing.T) {
+	boundary := time.Date(2026, time.September, 1, 10, 0, 0, 0, time.UTC)
+	highWater := boundary.Add(-time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &fakeNativeReader{
+		storeFn: func(context.Context, nativeQuery, func(nativeEvent) error) error {
+			cancel()
+			return nil
+		},
 	}
-	return ""
+	inp := &input{config: config{}, reader: reader, now: func() time.Time { return boundary }}
+	state := newCursorState("source-hash")
+	state.HighWaterMicros = highWater.UnixMicro()
+
+	err := inp.runWithStateAndMetrics(ctx, &recordingPublisher{}, nil, logp.NewLogger("unifiedlogs_test"), state)
+	require.NoError(t, err, "canceling after the resume Store query should stop cleanly")
+	storeQueries, streamQueries := reader.queries()
+	require.Len(t, storeQueries, 1, "a resumed input should backfill the Store gap")
+	require.Len(t, streamQueries, 1, "a resumed input should also start live collection")
+	assert.True(t, highWater.Add(-cursorOverlap).Equal(storeQueries[0].Start), "resume should query the full five-second overlap")
+	assert.Equal(t, boundary, storeQueries[0].End, "resume history should be bounded by the stream start")
 }
 
-func eventsAndCursorAssertN(n int) func(collect *assert.CollectT, events []beat.Event, cursors []*time.Time) {
-	return func(collect *assert.CollectT, events []beat.Event, cursors []*time.Time) {
-		assert.Len(collect, events, n)
-		assert.Len(collect, cursors, n)
-		lastEvent := events[len(events)-1]
-		lastCursor := cursors[len(cursors)-1]
-		assert.Equal(collect, &lastEvent.Timestamp, lastCursor)
+func TestStreamFailurePermanentlyFallsBackToStorePolling(t *testing.T) {
+	boundary := time.Date(2026, time.September, 1, 10, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	var nowCalls atomic.Int32
+	var storeCalls atomic.Int32
+	reader := &fakeNativeReader{
+		streamFn: func(context.Context, nativeQuery, func(nativeEvent) error) error {
+			return &nativeStreamFallbackError{Reason: 6, Err: errNativeReaderUnsupported}
+		},
+		storeFn: func(_ context.Context, query nativeQuery, emit func(nativeEvent) error) error {
+			storeCalls.Add(1)
+			if err := emit(testNativeLog(query.End, "polled")); err != nil {
+				return err
+			}
+			cancel()
+			return nil
+		},
 	}
+	inp := &input{
+		config:       config{},
+		reader:       reader,
+		pollInterval: time.Millisecond,
+		settleDelay:  time.Second,
+		now: func() time.Time {
+			if nowCalls.Add(1) == 1 {
+				return boundary
+			}
+			return boundary.Add(10 * time.Second)
+		},
+	}
+	pub := &recordingPublisher{}
+
+	err := inp.runWithMetrics(ctx, pub, testMetricsRegistry(), logp.NewLogger("unifiedlogs_test"))
+	require.NoError(t, err, "Store polling fallback should stop cleanly when canceled")
+	assert.Equal(t, int32(1), storeCalls.Load(), "the fallback should poll one snapshot before cancellation")
+
+	storeQueries, streamQueries := reader.queries()
+	require.Len(t, streamQueries, 1, "private streaming should be attempted only once per input run")
+	require.Len(t, storeQueries, 1, "the failed private stream should fall back to Store polling")
+	assert.Equal(t, boundary, storeQueries[0].Start, "the first fallback poll should not read before the run boundary")
+	assert.Equal(t, boundary.Add(9*time.Second), storeQueries[0].End, "polling should honor the configured settling delay")
+	events, _ := pub.snapshot()
+	assert.Len(t, events, 1, "the Store polling fallback should publish its native event")
 }
 
-func openArchive() (string, error) {
-	return extractTarGz(path.Join("testdata", "test.logarchive.tar.gz"))
+func TestFatalStoreErrorStopsInput(t *testing.T) {
+	sentinel := errors.New("store failed")
+	reader := &fakeNativeReader{
+		storeFn: func(context.Context, nativeQuery, func(nativeEvent) error) error {
+			return sentinel
+		},
+	}
+	inp := &input{
+		config: config{ShowConfig: showConfig{ArchiveFile: "/tmp/test.logarchive"}},
+		reader: reader,
+	}
+
+	err := inp.runWithMetrics(context.Background(), &recordingPublisher{}, nil, logp.NewLogger("unifiedlogs_test"))
+	require.Error(t, err, "a fatal native Store error should stop the input")
+	assert.ErrorIs(t, err, sentinel, "the fatal Store error should retain its cause")
 }
 
-func extractTarGz(tarGzPath string) (string, error) {
-	// Create a temporary directory
-	tempDir, err := os.MkdirTemp("", "extracted-*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary directory: %w", err)
+func TestCancellationStopsBlockedNativeStore(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	reader := &fakeNativeReader{
+		storeFn: func(ctx context.Context, _ nativeQuery, _ func(nativeEvent) error) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
 	}
-
-	// Use the 'tar' command to extract the .tar.gz file
-	cmd := exec.Command("tar", "-xzf", tarGzPath, "-C", tempDir)
-
-	// Run the command
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to extract .tar.gz: %w", err)
+	inp := &input{
+		config: config{ShowConfig: showConfig{ArchiveFile: "/tmp/test.logarchive"}},
+		reader: reader,
 	}
+	done := make(chan error, 1)
+	go func() {
+		done <- inp.runWithMetrics(ctx, &recordingPublisher{}, nil, logp.NewLogger("unifiedlogs_test"))
+	}()
 
-	return path.Join(tempDir, "test.logarchive"), nil
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the native Store read to start")
+	}
+	cancel()
+	require.NoError(t, <-done, "context cancellation should stop a blocked Store read without a fatal error")
 }
 
 func testMetricsRegistry() *monitoring.Registry {
-	reg := inputmon.NewMetricsRegistry(
+	return inputmon.NewMetricsRegistry(
 		"", "", monitoring.NewRegistry(), logp.NewLogger("test"))
-	return reg
 }

@@ -15,26 +15,17 @@ Only available for macOS.
 ::::
 
 
-The unified logging system provides a comprehensive and performant API to capture telemetry across all levels of the system. This system centralizes the storage of log data in memory and on disk, rather than writing that data to a text-based log file.
+The unified logging system provides a comprehensive and performant API to capture telemetry across all levels of macOS. It centralizes log data in memory and on disk instead of writing it to a text-based log file.
 
-The input interacts with the `log` command-line tool to provide access to the events.
+The input uses native macOS unified logging APIs. `OSLogStore` reads historical events, resumes a source, applies time bounds, and reads `.logarchive` bundles. Live collection uses the private `OSLogEventLiveStore` and `OSLogEventLiveStream` APIs when they are available. If that stream cannot be activated or becomes invalid, the input permanently switches to native `OSLogStore` snapshots until Filebeat is restarted. Snapshots are taken every second after a two-second settling delay and use a five-second overlap to avoid losing events. The input never invokes or falls back to the `log` command-line tool.
 
-The input starts streaming events from the current point in time unless a start date or the `backfill` options are set. When restarted it will continue where it left off.
+The input starts collecting from the current point in time unless a start date or the `backfill` option is set. On restart, a native cursor resumes from the previous high-water mark and removes events already acknowledged. A legacy timestamp-only cursor is accepted and may replay events from the first five-second overlap while event IDs are learned.
 
-Alternatively, it can also do one off operations, such as:
+An `archive_file` or an `end` date makes the operation one-shot. After the bounded history or archive has been read, the input stops. `backfill` can be combined with live collection to read historical events and then continue streaming.
 
-* Stream events contained in a `.logarchive` file.
-* Stream events contained in a `.tracev3` file.
-* Stream events in a specific time span, by providing a specific end date.
-
-After this one off operations complete, the input will stop.
+Reading the system store generally requires administrator privileges and an unsandboxed process. Run Filebeat with the permissions needed to access the system log store and any archive path; the input cannot elevate its own privileges. Native APIs require macOS 10.15 or newer.
 
 Other configuration options can be specified to filter what events to process.
-
-::::{note}
-The input can cause some duplicated events when backfilling and/or restarting. This is caused by how the underlying fetching method works and should be taken into account when using the input.
-::::
-
 
 Example configuration:
 
@@ -71,74 +62,82 @@ The `unifiedlogs` input supports the following configuration options plus the [C
 
 ### `archive_file` [_archive_file]
 
-Display events stored in the given archive. The archive must be a valid log archive bundle with the suffix `.logarchive`.
-
-
-### `trace_file` [_trace_file]
-
-Display events stored in the given `.tracev3` file. In order to be decoded, the file must be contained within a valid `.logarchive`
+Display events stored in the given archive. The archive must be a valid log archive bundle with the suffix `.logarchive`. Archive reads use `OSLogStore` and stop when the archive has been read.
 
 
 ### `start` [_start]
 
-Shows content starting from the provided date. The following date/time formats are accepted: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD HH:MM:SSZZZZZ`.
+Shows content starting from the provided date. The start bound is inclusive. The following date/time formats are accepted: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD HH:MM:SSZZZZZ`.
 
 
 ### `end` [_end]
 
-Shows content up to the provided date. The following date/time formats are accepted: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD HH:MM:SSZZZZZ`.
+Shows content up to the provided date. The end bound is inclusive. The following date/time formats are accepted: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DD HH:MM:SSZZZZZ`.
 
 
 ### `predicate` [_predicate]
 
-Filters messages using the provided predicate based on NSPredicate. A compound predicate or multiple predicates can be provided as a list.
+Filters messages using the provided predicate based on NSPredicate. Multiple predicate entries are combined with OR. A compound predicate or multiple predicates can be provided as a list.
 
 For detailed information on the use of predicate based filtering, please refer to the [Predicate Programming Guide](https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/Predicates/Articles/pSyntax.html).
 
 
 ### `process` [_process]
 
-A list of the processes on which to operate. It accepts a PID or process name.
-
-
-### `source` [_source]
-
-Include symbol names and source line numbers for messages, if available. Default: `false`.
+A list of processes on which to operate. It accepts a PID or process name. Multiple process selectors are combined with OR.
 
 
 ### `info` [_info]
 
-Disable or enable info level messages. Default: `false`.
+Enable info level messages. Default: `false`.
 
 
 ### `debug` [_debug]
 
-Disable or enable debug level messages. Default: `false`.
-
-
-### `backtrace` [_backtrace]
-
-Disable or enable display of backtraces. Default: `false`.
+Enable debug level messages. Default: `false`.
 
 
 ### `signpost` [_signpost]
 
-Disable or enable display of signposts. Default: `false`.
-
-
-### `unreliable` [_unreliable]
-
-Annotate events with whether the log was emitted unreliably. Default: `false`.
-
-
-### `mach_continuous_time` [_mach_continuous_time]
-
-Use mach continuous time timestamps rather than walltime. Default: `false`.
+Enable signpost events. Default: `false`.
 
 
 ### `backfill` [_backfill]
 
 If set to true the input will process all available logs since the beginning of time the first time it starts. Default: `false`.
+
+
+## Rejected options [_rejected_options]
+
+The following options belonged to the former `log` command-line implementation and are not available with the native APIs. Configuring any of them is an explicit configuration error; they are never silently ignored:
+
+* `trace_file` — native readers accept a `.logarchive` bundle through `archive_file`, not an individual `.tracev3` file.
+* `source` — native events do not expose the command-line source annotation.
+* `backtrace` — native events do not expose command-line backtrace output.
+* `unreliable` — native events do not expose the command-line reliability annotation.
+* `mach_continuous_time` — native events use their wall-clock event date.
+
+
+## Event fields [_event_fields]
+
+The outer Filebeat event shape is unchanged. The outer event timestamp is the native event date and `message` contains compact JSON. The JSON contains these best-effort CLI-compatible fields when the native event provides them:
+
+* `timestamp`
+* `eventType` and `eventMessage`
+* `messageType`
+* `process`, `processID`, `sender`, and `threadID`
+* `activityIdentifier`, `parentActivityIdentifier`, and `transitionActivityIdentifier`
+* `subsystem`, `category`, and `formatString`
+* signpost identifiers, names, types, and scopes
+
+Fields that are unavailable from the native API are omitted. The `messageType` value is normalized to `Default`, `Info`, `Debug`, `Error`, or `Fault`. Native kinds are normalized to the corresponding `logEvent`, `signpostEvent`, `activityCreateEvent`, `activityTransitionEvent`, `lossEvent`, or `stateEvent` values.
+
+
+## Cursor and deduplication [_cursor_and_deduplication]
+
+The input persists a versioned cursor through Filebeat acknowledgements. It contains a microsecond high-water mark, a hash of the source configuration, and a capped multiset of up to 100,000 recent SHA-256 event IDs. The multiset handles the five-second snapshot overlap and identical events without dropping distinct records. A configuration change starts a new source position. Cursors advance only after the corresponding event is acknowledged.
+
+Existing timestamp-only cursors are migrated automatically. Because they do not contain event IDs, the first native run can replay events in the five-second overlap; later restarts use the event-ID multiset for deduplication.
 
 
 ## Common options [filebeat-input-unifiedlogs-common-options]
@@ -224,12 +223,10 @@ By default, all events contain `host.name`. This option can be set to `true` to 
 
 ## Metrics [_metrics_17]
 
-This input exposes metrics under the [HTTP monitoring endpoint](http-endpoint.md). These metrics are exposed under the `/inputs/` path. They can be used to observe the activity of the input.
-
-You must assign a unique `id` to the input to expose metrics.
+This input exposes metrics under the [HTTP monitoring endpoint](http-endpoint.md). These metrics are exposed under the `/inputs/` path. You must assign a unique `id` to the input to expose metrics.
 
 | Metric | Description |
 | --- | --- |
 | `errors_total` | Total number of errors. |
-
-
+| `stream_fallbacks_total` | Number of live stream setups or invalidations that caused a permanent switch to Store polling. |
+| `duplicates_dropped_total` | Number of events dropped because their native event ID was already acknowledged or observed in the overlap window. |

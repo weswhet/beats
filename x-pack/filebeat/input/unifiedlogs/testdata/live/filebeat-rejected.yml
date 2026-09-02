@@ -1,0 +1,16 @@
+filebeat.inputs:
+  - type: unifiedlogs
+    id: unifiedlogs-e2e-rejected-options
+    enabled: true
+    trace_file: /tmp/unsupported.tracev3
+    source: false
+    backtrace: false
+    unreliable: false
+    mach_continuous_time: false
+
+output.console:
+  enabled: true
+
+logging.level: debug
+logging.selectors: ["*"]
+logging.to_stderr: true
